@@ -45,15 +45,40 @@ export class WebSocketClient extends AbstractSocketClient {
 			return
 		}
 
-		const closePromise = new Promise<void>(resolve => {
-			this.socket?.once('close', resolve)
-		})
-
-		this.socket.close()
-
-		await closePromise
-
+		const socket = this.socket
 		this.socket = null
+
+		await new Promise<void>(resolve => {
+			let settled = false
+			const finish = () => {
+				if (settled) return
+				settled = true
+				resolve()
+			}
+
+			// don't let a stuck/unresponsive socket hang cleanup forever - this matters a lot
+			// for 24/7 bots: if close() never resolves, end() never finishes, and the caller's
+			// reconnection logic never gets to run.
+			const timeout = setTimeout(() => {
+				try {
+					socket.terminate()
+				} catch {}
+
+				finish()
+			}, 5000)
+
+			socket.once('close', () => {
+				clearTimeout(timeout)
+				finish()
+			})
+
+			try {
+				socket.close()
+			} catch {
+				clearTimeout(timeout)
+				finish()
+			}
+		})
 	}
 	send(str: string | Uint8Array, cb?: (err?: Error) => void): boolean {
 		this.socket?.send(str, cb)
