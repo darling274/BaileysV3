@@ -2,7 +2,7 @@ import { proto } from '../../WAProto/index.js'
 import { makeLibSignalRepository } from '../Signal/libsignal'
 import type { AuthenticationState, SocketConfig, WAVersion } from '../Types'
 import { Browsers } from '../Utils/browser-utils'
-import logger from '../Utils/logger'
+import logger, { makeQuietLogger } from '../Utils/logger'
 
 const version = [2, 3000, 1035194821]
 
@@ -64,7 +64,7 @@ export const DEFAULT_CONNECTION_CONFIG: SocketConfig = {
 	waWebSocketUrl: 'wss://web.whatsapp.com/ws/chat',
 	connectTimeoutMs: 20_000,
 	keepAliveIntervalMs: 30_000,
-	logger: logger.child({ class: 'baileys' }),
+	logger: makeQuietLogger(logger.child({ class: 'baileys' })),
 	emitOwnEvents: true,
 	defaultQueryTimeoutMs: 60_000,
 	customUploadHosts: [],
@@ -141,7 +141,7 @@ export const MIN_PREKEY_COUNT = 5
 
 export const INITIAL_PREKEY_COUNT = 812
 
-export const UPLOAD_TIMEOUT = 30000 // 30 seconds
+export const UPLOAD_TIMEOUT = 30000 
 
 export const TimeMs = {
 	Minute: 60 * 1000,
