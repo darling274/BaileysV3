@@ -391,6 +391,12 @@ export const makeSocket = (config: SocketConfig) => {
 	let keepAliveReq: NodeJS.Timeout
 	let qrTimer: NodeJS.Timeout
 	let closed = false
+	/** guards against the 'open' handler running the handshake twice on the same socket */
+	let handshakeStarted = false
+	/** periodically re-validates pre-keys on the server so corruption is caught & repaired
+	 *  automatically on bots that stay connected for days, instead of only checking once at login */
+	let preKeyHealthInterval: NodeJS.Timeout | undefined
+	const PRE_KEY_HEALTH_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000 // every 6 hours
 
 	const socketEndHandlers: Array<(error: Error | undefined) => void | Promise<void>> = []
 
@@ -635,17 +641,28 @@ export const makeSocket = (config: SocketConfig) => {
 
 		clearInterval(keepAliveReq)
 		clearTimeout(qrTimer)
+		clearInterval(preKeyHealthInterval)
+		handshakeStarted = false
+		uploadPreKeysPromise = null
 
-		ws.removeAllListeners('close')
-		ws.removeAllListeners('open')
-		ws.removeAllListeners('message')
+		// detach every listener we ever attached to this socket instance - prevents leaking
+		// closures (creds/keys/ev references) if the caller keeps a stale reference around,
+		// and guarantees a fresh `makeSocket()` call can never end up with two live sockets
+		// reacting to the same underlying connection.
+		ws.removeAllListeners()
 
-		signalRepository.close?.()
+		try {
+			signalRepository.close?.()
+		} catch (closeErr) {
+			logger.trace({ closeErr }, 'error while closing signal repository during cleanup')
+		}
 
 		if (!ws.isClosed && !ws.isClosing) {
 			try {
 				await ws.close()
-			} catch {}
+			} catch (closeErr) {
+				logger.trace({ closeErr }, 'error while closing websocket during cleanup')
+			}
 		}
 
 		for (const handler of socketEndHandlers) {
@@ -854,6 +871,13 @@ export const makeSocket = (config: SocketConfig) => {
 	ws.on('message', onMessageReceived)
 
 	ws.on('open', async () => {
+		if (handshakeStarted) {
+			logger.warn('ignoring duplicate "open" event - handshake already in progress')
+			return
+		}
+
+		handshakeStarted = true
+
 		try {
 			await validateConnection()
 		} catch (err: any) {
@@ -951,6 +975,17 @@ export const makeSocket = (config: SocketConfig) => {
 
 		logger.info('opened connection to WA')
 		clearTimeout(qrTimer) // will never happen in all likelyhood -- but just in case WA sends success on first try
+
+		// proactively re-check pre-key health on a recurring basis. This is what lets a
+		// 24/7 bot self-heal from corrupted/exhausted pre-keys without ever needing a
+		// manual session wipe - the same logic that runs once at login now keeps running
+		// for as long as the socket stays open.
+		clearInterval(preKeyHealthInterval)
+		preKeyHealthInterval = setInterval(() => {
+			uploadPreKeysToServerIfRequired().catch(err => {
+				logger.trace({ err }, 'periodic pre-key health check failed, will retry next cycle')
+			})
+		}, PRE_KEY_HEALTH_CHECK_INTERVAL_MS)
 
 		ev.emit('creds.update', { me: { ...authState.creds.me!, lid: node.attrs.lid } })
 
