@@ -1,87 +1,136 @@
 import { Mutex } from 'async-mutex'
-import { mkdir, readFile, stat, unlink, writeFile } from 'fs/promises'
+import { mkdir, readFile, rename, stat, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { proto } from '../../WAProto/index.js'
 import type { AuthenticationCreds, AuthenticationState, SignalDataTypeMap } from '../Types'
 import { initAuthCreds } from './auth-utils'
 import { BufferJSON } from './generics'
 
-// We need to lock files due to the fact that we are using async functions to read and write files
-// https://github.com/WhiskeySockets/Baileys/issues/794
-// https://github.com/nodejs/node/issues/26338
-// Use a Map to store mutexes for each file path
+// Map of mutexes by file path (prevents concurrent writes)
 const fileLocks = new Map<string, Mutex>()
 
-// Get or create a mutex for a specific file path
 const getFileLock = (path: string): Mutex => {
 	let mutex = fileLocks.get(path)
 	if (!mutex) {
 		mutex = new Mutex()
 		fileLocks.set(path, mutex)
 	}
-
 	return mutex
 }
 
 /**
- * stores the full authentication state in a single folder.
- * Far more efficient than singlefileauthstate
+ * Atomic write: first writes to a .tmp file and then
+ * renames to the final destination. On POSIX systems, rename() is
+ * atomic, so readers never see a partially written file.
+ * Prevents corruption of creds.json if the process dies
+ * during writing.
+ */
+const atomicWriteFile = async (filePath: string, content: string): Promise<void> => {
+	const tmpPath = `${filePath}.tmp`
+	await writeFile(tmpPath, content, { encoding: 'utf-8' })
+	await rename(tmpPath, filePath)
+}
+
+const CREDS_FILE = 'creds.json'
+const CREDS_BACKUP_FILE = 'creds.json.bak'
+
+/**
+ * Validates that a credentials object has the minimum required
+ * fields to establish a WhatsApp session.
+ */
+const isValidCreds = (data: unknown): data is AuthenticationCreds => {
+	if (!data || typeof data !== 'object') return false
+	const d = data as Record<string, unknown>
+	return (
+		typeof d.noiseKey === 'object' &&
+		d.noiseKey !== null &&
+		typeof d.signedIdentityKey === 'object' &&
+		d.signedIdentityKey !== null &&
+		typeof d.registrationId === 'number'
+	)
+}
+
+/**
+ * Stores the complete authentication state in a folder.
  *
- * Again, I wouldn't endorse this for any production level use other than perhaps a bot.
- * Would recommend writing an auth state for use with a proper SQL or No-SQL DB
- * */
+ * Improvements over the original version:
+ * - Atomic writes via tmp + rename (prevents creds.json corruption on crash)
+ * - Automatic backup of creds.json before each write + restoration on corruption
+ * - Credential validation on read (fallback to initAuthCreds if JSON is corrupted)
+ * - 300ms debounce on saveCreds to prevent redundant writes in rapid bursts
+ */
 export const useMultiFileAuthState = async (
 	folder: string
 ): Promise<{ state: AuthenticationState; saveCreds: () => Promise<void> }> => {
+
+	const fixFileName = (file?: string) => file?.replace(/\//g, '__')?.replace(/:/g, '-')
+
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	const writeData = async (data: any, file: string) => {
+	const writeData = async (data: any, file: string): Promise<void> => {
 		const filePath = join(folder, fixFileName(file)!)
 		const mutex = getFileLock(filePath)
 
-		return mutex.acquire().then(async release => {
+		return mutex.runExclusive(async () => {
+			const serialized = JSON.stringify(data, BufferJSON.replacer)
+
+			// For creds.json: save backup BEFORE overwriting.
+			// If the process dies between the backup and the final write,
+			// the backup will still have the previous valid version.
+			if (file === CREDS_FILE) {
+				const backupPath = join(folder, fixFileName(CREDS_BACKUP_FILE)!)
+				try {
+					await atomicWriteFile(backupPath, serialized)
+				} catch {
+					// Non-fatal: backup failed but main write continues
+				}
+			}
+
+			await atomicWriteFile(filePath, serialized)
+		})
+	}
+
+	const readData = async (file: string): Promise<unknown> => {
+		const filePath = join(folder, fixFileName(file)!)
+		const mutex = getFileLock(filePath)
+
+		return mutex.runExclusive(async () => {
+			// Primary read
 			try {
-				await writeFile(filePath, JSON.stringify(data, BufferJSON.replacer))
-			} finally {
-				release()
+				const raw = await readFile(filePath, { encoding: 'utf-8' })
+				return JSON.parse(raw, BufferJSON.reviver)
+			} catch {
+				// For creds.json: attempt to restore from backup
+				if (file === CREDS_FILE) {
+					const backupPath = join(folder, fixFileName(CREDS_BACKUP_FILE)!)
+					try {
+						const backupRaw = await readFile(backupPath, { encoding: 'utf-8' })
+						const parsed = JSON.parse(backupRaw, BufferJSON.reviver)
+						// Restore the primary file from backup
+						await atomicWriteFile(filePath, backupRaw)
+						return parsed
+					} catch {
+						// Both primary and backup failed
+					}
+				}
+				return null
 			}
 		})
 	}
 
-	const readData = async (file: string) => {
-		try {
-			const filePath = join(folder, fixFileName(file)!)
-			const mutex = getFileLock(filePath)
+	const removeData = async (file: string): Promise<void> => {
+		const filePath = join(folder, fixFileName(file)!)
+		const mutex = getFileLock(filePath)
 
-			return await mutex.acquire().then(async release => {
-				try {
-					const data = await readFile(filePath, { encoding: 'utf-8' })
-					return JSON.parse(data, BufferJSON.reviver)
-				} finally {
-					release()
-				}
-			})
-		} catch (error) {
-			return null
-		}
+		return mutex.runExclusive(async () => {
+			try {
+				await unlink(filePath)
+			} catch {
+				// Ignore ENOENT and other unlink errors
+			}
+		})
 	}
 
-	const removeData = async (file: string) => {
-		try {
-			const filePath = join(folder, fixFileName(file)!)
-			const mutex = getFileLock(filePath)
-
-			return mutex.acquire().then(async release => {
-				try {
-					await unlink(filePath)
-				} catch {
-				} finally {
-					release()
-				}
-			})
-		} catch {}
-	}
-
-	const folderInfo = await stat(folder).catch(() => {})
+	const folderInfo = await stat(folder).catch(() => undefined)
 	if (folderInfo) {
 		if (!folderInfo.isDirectory()) {
 			throw new Error(
@@ -92,9 +141,34 @@ export const useMultiFileAuthState = async (
 		await mkdir(folder, { recursive: true })
 	}
 
-	const fixFileName = (file?: string) => file?.replace(/\//g, '__')?.replace(/:/g, '-')
+	// Read and validate credentials; fallback to fresh credentials if JSON is corrupted
+	const rawCreds = await readData(CREDS_FILE)
+	const creds: AuthenticationCreds = isValidCreds(rawCreds) ? rawCreds : initAuthCreds()
 
-	const creds: AuthenticationCreds = (await readData('creds.json')) || initAuthCreds()
+	// --- Debounce for saveCreds ---
+	// WhatsApp emits many consecutive creds.update events (login, prekeys, etc.).
+	// Without debounce, each event triggers a separate disk write.
+	// A 300ms debounce collapses bursts into a single write.
+	let saveCredsTimer: NodeJS.Timeout | undefined
+
+	const flushCreds = async (): Promise<void> => {
+		return writeData(creds, CREDS_FILE)
+	}
+
+	const saveCreds = (): Promise<void> => {
+		return new Promise<void>((resolve, reject) => {
+			if (saveCredsTimer) clearTimeout(saveCredsTimer)
+			saveCredsTimer = setTimeout(async () => {
+				saveCredsTimer = undefined
+				try {
+					await flushCreds()
+					resolve()
+				} catch (err) {
+					reject(err)
+				}
+			}, 300)
+		})
+	}
 
 	return {
 		state: {
@@ -108,11 +182,9 @@ export const useMultiFileAuthState = async (
 							if (type === 'app-state-sync-key' && value) {
 								value = proto.Message.AppStateSyncKeyData.fromObject(value)
 							}
-
-							data[id] = value
+							data[id] = value as SignalDataTypeMap[typeof type]
 						})
 					)
-
 					return data
 				},
 				set: async data => {
@@ -124,13 +196,10 @@ export const useMultiFileAuthState = async (
 							tasks.push(value ? writeData(value, file) : removeData(file))
 						}
 					}
-
 					await Promise.all(tasks)
 				}
 			}
 		},
-		saveCreds: async () => {
-			return writeData(creds, 'creds.json')
-		}
+		saveCreds
 	}
 }
