@@ -29,10 +29,12 @@ interface TransactionContext {
 }
 
 /**
- * Adds caching capability to a SignalKeyStore
- * @param store the store to add caching to
- * @param logger to log trace events
- * @param _cache cache store to use
+ * Adds caching to a SignalKeyStore.
+ * Improvements:
+ * - Deleted keys (null) are removed from cache instead of
+ *   being stored as null, preventing inconsistent reads
+ *   in long-running sessions.
+ * - Cache TTL is configurable via DEFAULT_CACHE_TTLS.
  */
 export function makeCacheableSignalKeyStore(
 	store: SignalKeyStore,
@@ -42,12 +44,11 @@ export function makeCacheableSignalKeyStore(
 	const cache =
 		_cache ||
 		new NodeCache<SignalDataTypeMap[keyof SignalDataTypeMap]>({
-			stdTTL: DEFAULT_CACHE_TTLS.SIGNAL_STORE, // 5 minutes
+			stdTTL: DEFAULT_CACHE_TTLS.SIGNAL_STORE,
 			useClones: false,
 			deleteOnExpire: true
 		})
 
-	// Mutex for protecting cache operations
 	const cacheMutex = new Mutex()
 
 	function getUniqueId(type: string, id: string) {
@@ -79,6 +80,8 @@ export function makeCacheableSignalKeyStore(
 							// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
 							await cache.set(getUniqueId(type, id), item as SignalDataTypeMap[keyof SignalDataTypeMap])
 						}
+						// If item is null/undefined, do not store in cache.
+						// This way the next read will go to the store and get the real state.
 					}
 				}
 
@@ -90,7 +93,17 @@ export function makeCacheableSignalKeyStore(
 				let keys = 0
 				for (const type in data) {
 					for (const id in data[type as keyof SignalDataTypeMap]) {
-						await cache.set(getUniqueId(type, id), data[type as keyof SignalDataTypeMap]![id]!)
+						const value = data[type as keyof SignalDataTypeMap]![id]
+						const cacheKey = getUniqueId(type, id)
+
+						if (value !== null && value !== undefined) {
+							// Update cache with the new value
+							await cache.set(cacheKey, value as SignalDataTypeMap[keyof SignalDataTypeMap])
+						} else {
+							// Deleted key: explicitly remove from cache
+							// This prevents future reads from returning a stale value
+							await cache.del(cacheKey)
+						}
 						keys += 1
 					}
 				}
@@ -107,11 +120,8 @@ export function makeCacheableSignalKeyStore(
 }
 
 /**
- * Adds DB-like transaction capability to the SignalKeyStore
- * Uses AsyncLocalStorage for automatic context management
- * @param state the key store to apply this capability to
- * @param logger logger to log events
- * @returns SignalKeyStore with transaction capability
+ * Adds transaction capability to SignalKeyStore.
+ * Uses AsyncLocalStorage for automatic context management.
  */
 export const addTransactionCapability = (
 	state: SignalKeyStore,
@@ -120,55 +130,37 @@ export const addTransactionCapability = (
 ): SignalKeyStoreWithTransaction => {
 	const txStorage = new AsyncLocalStorage<TransactionContext>()
 
-	// Queues for concurrency control (keyed by signal data type - bounded set)
 	const keyQueues = new Map<string, PQueue>()
 
-	// Transaction mutexes with reference counting for cleanup
 	const txMutexes = new Map<string, Mutex>()
 	const txMutexRefCounts = new Map<string, number>()
 
-	// Pre-key manager for specialized operations
 	const preKeyManager = new PreKeyManager(state, logger)
 
-	/**
-	 * Get or create a queue for a specific key type
-	 */
 	function getQueue(key: string): PQueue {
 		if (!keyQueues.has(key)) {
 			keyQueues.set(key, new PQueue({ concurrency: 1 }))
 		}
-
 		return keyQueues.get(key)!
 	}
 
-	/**
-	 * Get or create a transaction mutex
-	 */
 	function getTxMutex(key: string): Mutex {
 		if (!txMutexes.has(key)) {
 			txMutexes.set(key, new Mutex())
 			txMutexRefCounts.set(key, 0)
 		}
-
 		return txMutexes.get(key)!
 	}
 
-	/**
-	 * Acquire a reference to a transaction mutex
-	 */
 	function acquireTxMutexRef(key: string): void {
 		const count = txMutexRefCounts.get(key) ?? 0
 		txMutexRefCounts.set(key, count + 1)
 	}
 
-	/**
-	 * Release a reference to a transaction mutex and cleanup if no longer needed
-	 */
 	function releaseTxMutexRef(key: string): void {
 		const count = (txMutexRefCounts.get(key) ?? 1) - 1
 		txMutexRefCounts.set(key, count)
 
-		// Cleanup if no more references and mutex is not locked
 		if (count <= 0) {
 			const mutex = txMutexes.get(key)
 			if (mutex && !mutex.isLocked()) {
@@ -178,16 +170,10 @@ export const addTransactionCapability = (
 		}
 	}
 
-	/**
-	 * Check if currently in a transaction
-	 */
 	function isInTransaction(): boolean {
 		return !!txStorage.getStore()
 	}
 
-	/**
-	 * Commit transaction with retries
-	 */
 	async function commitWithRetry(mutations: SignalDataSet): Promise<void> {
 		if (Object.keys(mutations).length === 0) {
 			logger.trace('no mutations in transaction')
@@ -219,11 +205,9 @@ export const addTransactionCapability = (
 			const ctx = txStorage.getStore()
 
 			if (!ctx) {
-				// No transaction - direct read without exclusive lock for concurrency
 				return state.get(type, ids)
 			}
 
-			// In transaction - check cache first
 			const cached = ctx.cache[type] || {}
 			const missing = ids.filter(id => !(id in cached))
 
@@ -233,12 +217,10 @@ export const addTransactionCapability = (
 
 				const fetched = await getTxMutex(type).runExclusive(() => state.get(type, missing))
 
-				// Update cache
 				ctx.cache[type] = ctx.cache[type] || ({} as any)
 				Object.assign(ctx.cache[type]!, fetched)
 			}
 
-			// Return requested ids from cache
 			const result: { [key: string]: any } = {}
 			for (const id of ids) {
 				const value = ctx.cache[type]?.[id]
@@ -254,10 +236,9 @@ export const addTransactionCapability = (
 			const ctx = txStorage.getStore()
 
 			if (!ctx) {
-				// No transaction - direct write with queue protection
 				const types = Object.keys(data)
 
-				// Process pre-keys with validation
+				// Validate prekey deletions before writing
 				for (const type_ of types) {
 					const type = type_ as keyof SignalDataTypeMap
 					if (type === 'pre-key') {
@@ -265,7 +246,6 @@ export const addTransactionCapability = (
 					}
 				}
 
-				// Write all data in parallel
 				await Promise.all(
 					types.map(type =>
 						getQueue(type).add(async () => {
@@ -277,21 +257,17 @@ export const addTransactionCapability = (
 				return
 			}
 
-			// In transaction - update cache and mutations
 			logger.trace({ types: Object.keys(data) }, 'caching in transaction')
 
 			for (const key_ in data) {
 				const key = key_ as keyof SignalDataTypeMap
 
-				// Ensure structures exist
 				ctx.cache[key] = ctx.cache[key] || ({} as any)
 				ctx.mutations[key] = ctx.mutations[key] || ({} as any)
 
-				// Special handling for pre-keys
 				if (key === 'pre-key') {
 					await preKeyManager.processOperations(data, key, ctx.cache, ctx.mutations, true)
 				} else {
-					// Normal key types
 					Object.assign(ctx.cache[key]!, data[key])
 					Object.assign(ctx.mutations[key]!, data[key])
 				}
@@ -303,13 +279,11 @@ export const addTransactionCapability = (
 		transaction: async (work, key) => {
 			const existing = txStorage.getStore()
 
-			// Nested transaction - reuse existing context
 			if (existing) {
 				logger.trace('reusing existing transaction context')
 				return work()
 			}
 
-			// New transaction - acquire mutex and create context
 			const mutex = getTxMutex(key)
 			acquireTxMutexRef(key)
 
@@ -326,7 +300,6 @@ export const addTransactionCapability = (
 					try {
 						const result = await txStorage.run(ctx, work)
 
-						// Commit mutations
 						await commitWithRetry(ctx.mutations)
 
 						logger.trace({ dbQueries: ctx.dbQueries }, 'transaction completed')
@@ -345,15 +318,13 @@ export const addTransactionCapability = (
 }
 
 /**
- * Returns the authenticated user's JID, or throws a Boom-401 if creds are not yet authenticated.
- * Use this anywhere we'd otherwise reach for `creds.me!.id` to fail fast with a descriptive error.
+ * Returns the authenticated user's JID, or throws Boom-401 if not authenticated.
  */
 export const assertMeId = (creds: AuthenticationCreds): string => {
 	const id = creds.me?.id
 	if (!id) {
 		throw new Boom('Cannot proceed: socket is not authenticated yet (creds.me.id is missing)', { statusCode: 401 })
 	}
-
 	return id
 }
 
