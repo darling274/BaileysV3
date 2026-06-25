@@ -14,7 +14,6 @@ import {
 	isJidStatusBroadcast,
 	isLidUser,
 	isPnUser
-	//	transferDevice
 } from '../WABinary'
 import { unpadRandomMax16 } from './generics'
 import type { ILogger } from './logger'
@@ -23,7 +22,6 @@ export const getDecryptionJid = async (sender: string, repository: SignalReposit
 	if (isLidUser(sender) || isHostedLidUser(sender)) {
 		return sender
 	}
-
 	const mapped = await repository.lidMapping.getLIDForPN(sender)
 	return mapped || sender
 }
@@ -35,7 +33,6 @@ const storeMappingFromEnvelope = async (
 	decryptionJid: string,
 	logger: ILogger
 ): Promise<void> => {
-	// TODO: Handle hosted IDs
 	const { senderAlt } = extractAddressingContext(stanza)
 
 	if (senderAlt && isLidUser(senderAlt) && isPnUser(sender) && decryptionJid === sender) {
@@ -53,11 +50,26 @@ export const NO_MESSAGE_FOUND_ERROR_TEXT = 'Message absent from node'
 export const MISSING_KEYS_ERROR_TEXT = 'Key used already or never filled'
 export const ACCOUNT_RESTRICTED_TEXT = 'Your account has been restricted'
 
-// Retry configuration for failed decryption
 export const DECRYPTION_RETRY_CONFIG = {
 	maxRetries: 3,
 	baseDelayMs: 100,
-	sessionRecordErrors: ['No session record', 'SessionError: No session record']
+	// Patterns indicating that the Signal session is corrupted/missing
+	// and requires session recreation to recover.
+	sessionRecordErrors: [
+		'No session record',
+		'SessionError: No session record',
+		'Bad MAC',
+		'Message key not found',
+		'Remote identity changed'
+	],
+	// Patterns indicating a prekey error (key used or never initialized)
+	preKeyErrors: [
+		'Key used already or never filled',
+		'Invalid prekey ID',
+		'Invalid message version'
+	],
+	// Maximum time for an individual decrypt operation (ms)
+	decryptTimeoutMs: 15_000
 }
 
 /** NACK reason codes we send to the server (client → server) */
@@ -78,19 +90,8 @@ export const NACK_REASONS = {
 	DBOperationFailed: 552
 }
 
-/**
- * Server-side error codes returned in ack stanzas (server → client) that we
- * currently have dedicated handlers for. Extend as more handlers are added.
- * Distinct from the client-side NackReason enum (WAWebCreateNackFromStanza).
- */
 export const SERVER_ERROR_CODES = {
-	/**
-	 * 1:1 message missing privacy token (tctoken). Usually means the account is
-	 * restricted: WhatsApp blocks starting new chats but preserves existing ones,
-	 * since established chats already carry a tctoken.
-	 */
 	MessageAccountRestriction: '463',
-	/** Stanza validation failure (SMAX_INVALID) — likely stale device session */
 	SmaxInvalid: '479'
 } as const
 
@@ -111,27 +112,31 @@ export const extractAddressingContext = (stanza: BinaryNode) => {
 	const addressingMode = stanza.attrs.addressing_mode || (sender?.endsWith('lid') ? 'lid' : 'pn')
 
 	if (addressingMode === 'lid') {
-		// Message is LID-addressed: sender is LID, extract corresponding PN
-		// without device data
 		senderAlt = stanza.attrs.participant_pn || stanza.attrs.sender_pn || stanza.attrs.peer_recipient_pn
 		recipientAlt = stanza.attrs.recipient_pn
-		// with device data
-		//if (sender && senderAlt) senderAlt = transferDevice(sender, senderAlt)
 	} else {
-		// Message is PN-addressed: sender is PN, extract corresponding LID
-		// without device data
 		senderAlt = stanza.attrs.participant_lid || stanza.attrs.sender_lid || stanza.attrs.peer_recipient_lid
 		recipientAlt = stanza.attrs.recipient_lid
-
-		//with device data
-		//if (sender && senderAlt) senderAlt = transferDevice(sender, senderAlt)
 	}
 
-	return {
-		addressingMode,
-		senderAlt,
-		recipientAlt
-	}
+	return { addressingMode, senderAlt, recipientAlt }
+}
+
+/**
+ * Wraps a promise with a timeout to prevent decrypt operations
+ * from hanging indefinitely and blocking the process.
+ */
+function withDecryptTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const timer = setTimeout(
+			() => reject(new Error(`Decrypt operation timed out after ${ms}ms [${label}]`)),
+			ms
+		)
+		promise.then(
+			value => { clearTimeout(timer); resolve(value) },
+			error => { clearTimeout(timer); reject(error) }
+		)
+	})
 }
 
 /**
@@ -167,34 +172,25 @@ export function decodeMessageNode(stanza: BinaryNode, meId: string, meLid: strin
 			if (!isMe(from) && !isMeLid(from)) {
 				throw new Boom('receipient present, but msg not from me', { data: stanza })
 			}
-
 			if (isMe(from) || isMeLid(from)) {
 				fromMe = true
 			}
-
 			chatId = recipient
 		} else {
-			// Peer-routed self stanzas (history sync, app-state sync, etc.) arrive
-			// with `from` set to our own device but no `recipient` attribute —
-			// still mark as fromMe so self-only protocolMessage handlers run.
 			if (isMe(from) || isMeLid(from)) {
 				fromMe = true
 			}
-
 			chatId = from
 		}
-
 		msgType = 'chat'
 		author = from
 	} else if (isJidGroup(from)) {
 		if (!participant) {
 			throw new Boom('No participant in group message')
 		}
-
 		if (isMe(participant) || isMeLid(participant)) {
 			fromMe = true
 		}
-
 		msgType = 'group'
 		author = participant
 		chatId = from
@@ -202,14 +198,12 @@ export function decodeMessageNode(stanza: BinaryNode, meId: string, meLid: strin
 		if (!participant) {
 			throw new Boom('No participant in group message')
 		}
-
 		const isParticipantMe = isMe(participant)
 		if (isJidStatusBroadcast(from)) {
 			msgType = isParticipantMe ? 'direct_peer_status' : 'other_status'
 		} else {
 			msgType = isParticipantMe ? 'peer_broadcast' : 'other_broadcast'
 		}
-
 		fromMe = isParticipantMe
 		chatId = from
 		author = participant
@@ -217,7 +211,6 @@ export function decodeMessageNode(stanza: BinaryNode, meId: string, meLid: strin
 		msgType = 'newsletter'
 		chatId = from
 		author = from
-
 		if (isMe(from) || isMeLid(from)) {
 			fromMe = true
 		}
@@ -284,7 +277,7 @@ export const decryptMessageNode = (
 					}
 
 					if (tag === 'unavailable' && attrs.type === 'view_once') {
-						fullMessage.key.isViewOnce = true // TODO: remove from here and add a STUB TYPE
+						fullMessage.key.isViewOnce = true
 					}
 
 					if (attrs.count && tag === 'enc') {
@@ -306,49 +299,58 @@ export const decryptMessageNode = (
 					const decryptionJid = await getDecryptionJid(author, repository)
 
 					if (tag !== 'plaintext') {
-						// TODO: Handle hosted devices
 						await storeMappingFromEnvelope(stanza, author, repository, decryptionJid, logger)
 					}
 
 					try {
 						const e2eType = tag === 'plaintext' ? 'plaintext' : attrs.type
 
-						switch (e2eType) {
-							case 'skmsg':
-								msgBuffer = await repository.decryptGroupMessage({
-									group: sender,
-									authorJid: author,
-									msg: content
-								})
-								break
-							case 'pkmsg':
-							case 'msg':
-								msgBuffer = await repository.decryptMessage({
-									jid: decryptionJid,
-									type: e2eType,
-									ciphertext: content
-								})
-								break
-							case 'plaintext':
-								msgBuffer = content
-								break
-							default:
-								throw new Error(`Unknown e2e type: ${e2eType}`)
+						// Wrap the decrypt operation with a timeout to prevent
+						// indefinite hangs if the Signal library freezes
+						const decryptOp = async (): Promise<Uint8Array> => {
+							switch (e2eType) {
+								case 'skmsg':
+									return repository.decryptGroupMessage({
+										group: sender,
+										authorJid: author,
+										msg: content
+									})
+								case 'pkmsg':
+								case 'msg':
+									return repository.decryptMessage({
+										jid: decryptionJid,
+										type: e2eType,
+										ciphertext: content
+									})
+								case 'plaintext':
+									return content
+								default:
+									throw new Error(`Unknown e2e type: ${e2eType}`)
+							}
 						}
+
+						msgBuffer = await withDecryptTimeout(
+							decryptOp(),
+							DECRYPTION_RETRY_CONFIG.decryptTimeoutMs,
+							`${e2eType}/${sender}`
+						)
 
 						let msg: proto.IMessage = proto.Message.decode(
 							e2eType !== 'plaintext' ? unpadRandomMax16(msgBuffer) : msgBuffer
 						)
 						msg = msg.deviceSentMessage?.message || msg
+
 						if (msg.senderKeyDistributionMessage) {
-							//eslint-disable-next-line max-depth
 							try {
 								await repository.processSenderKeyDistributionMessage({
 									authorJid: author,
 									item: msg.senderKeyDistributionMessage
 								})
 							} catch (err) {
-								logger.error({ key: fullMessage.key, err }, 'failed to process sender key distribution message')
+								logger.error(
+									{ key: fullMessage.key, err },
+									'failed to process sender key distribution message'
+								)
 							}
 						}
 
@@ -357,25 +359,40 @@ export const decryptMessageNode = (
 						} else {
 							fullMessage.message = msg
 						}
-					} catch (err: any) {
+					} catch (err: unknown) {
+						const errMsg = (err as Error)?.message || String(err)
+						const isSessionErr = isSessionRecordError(err)
+						const isPreKeyErr = isPreKeyError(err)
+						const isTimeoutErr = errMsg.includes('timed out')
+
 						const errorContext = {
 							key: fullMessage.key,
 							err,
 							messageType: tag === 'plaintext' ? 'plaintext' : attrs.type,
 							sender,
 							author,
-							isSessionRecordError: isSessionRecordError(err)
+							decryptionJid,
+							isSessionRecordError: isSessionErr,
+							isPreKeyError: isPreKeyErr,
+							isTimeout: isTimeoutErr,
+							// Indicates whether recovery is possible by recreating the session
+							isRecoverable: isSessionErr || isPreKeyErr
 						}
 
 						logger.error(errorContext, 'failed to decrypt message')
 
 						fullMessage.messageStubType = proto.WebMessageInfo.StubType.CIPHERTEXT
-						fullMessage.messageStubParameters = [err.message.toString()]
+						// Preserve the error type in the parameters so that
+						// the caller can make informed recovery decisions
+						fullMessage.messageStubParameters = [
+							errMsg,
+							isSessionErr ? 'session_error' : isPreKeyErr ? 'prekey_error' : 'generic_error'
+						]
 					}
 				}
 			}
 
-			// if nothing was found to decrypt
+			// If nothing was found to decrypt
 			if (!decryptables && !fullMessage.key?.isViewOnce) {
 				fullMessage.messageStubType = proto.WebMessageInfo.StubType.CIPHERTEXT
 				fullMessage.messageStubParameters = [NO_MESSAGE_FOUND_ERROR_TEXT]
@@ -385,9 +402,23 @@ export const decryptMessageNode = (
 }
 
 /**
- * Utility function to check if an error is related to missing session record
+ * Detects whether the error is due to a corrupted or missing Signal session.
+ * These errors are recoverable by recreating the session with the contact.
  */
-function isSessionRecordError(error: any): boolean {
-	const errorMessage = error?.message || error?.toString() || ''
-	return DECRYPTION_RETRY_CONFIG.sessionRecordErrors.some(errorPattern => errorMessage.includes(errorPattern))
+function isSessionRecordError(error: unknown): boolean {
+	const errorMessage = (error as Error)?.message || String(error)
+	return DECRYPTION_RETRY_CONFIG.sessionRecordErrors.some(pattern =>
+		errorMessage.includes(pattern)
+	)
+}
+
+/**
+ * Detects whether the error is due to an invalid or already consumed prekey.
+ * These errors are recoverable by uploading new prekeys to the server.
+ */
+function isPreKeyError(error: unknown): boolean {
+	const errorMessage = (error as Error)?.message || String(error)
+	return DECRYPTION_RETRY_CONFIG.preKeyErrors.some(pattern =>
+		errorMessage.includes(pattern)
+	)
 }
