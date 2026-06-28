@@ -11,7 +11,6 @@ import {
 	NOISE_WA_HEADER,
 	PROCESSABLE_HISTORY_TYPES,
 	TimeMs,
-	UNAUTHORIZED_CODES,
 	UPLOAD_TIMEOUT
 } from '../Defaults'
 import {
@@ -68,12 +67,8 @@ import { executeWMexQuery } from './mex.js'
  * - simple queries (no retry mechanism, wait for connection establishment)
  * - listen to messages and emit events
  * - query phone connection
- *:
- * - Prekey circuit breaker: backs off after repeated server failures
- * - Prekey low notification handler: reacts immediately when WA reports low keys
- * - All async event handlers guarded with try/catch (no unhandled rejections)
- * - Stream errors classified as fatal vs transient (only fatal ones log as error)
  */
+
 export const makeSocket = (config: SocketConfig) => {
 	const {
 		waWebSocketUrl,
@@ -99,7 +94,7 @@ export const makeSocket = (config: SocketConfig) => {
 	if (printQRInTerminal) {
 		logger.warn(
 			{},
-			'⚠️ The printQRInTerminal option has been deprecated. You will no longer receive QR codes in the terminal automatically. Please listen to the connection.update event yourself and handle the QR your way. You can remove this message by removing this option. This message will be removed in a future version.'
+			'⚠️ The printQRInTerminal option has been deprecated. You will no longer receive QR codes in the terminal automatically. Please listen to the connection.update event yourself and handle the QR your way. You can remove this message by removing this opttion. This message will be removed in a future version.'
 		)
 	}
 
@@ -114,7 +109,7 @@ export const makeSocket = (config: SocketConfig) => {
 			.length === PROCESSABLE_HISTORY_TYPES.length
 	if (syncDisabled) {
 		logger.warn(
-			'⚠️ DANGER: DISABLING ALL SYNC BY shouldSyncHistoryMsg PREVENTS BAILEYS FROM ACCESSING INITIAL LID MAPPINGS, LEADING TO INSTABILITY AND SESSION ERRORS'
+			'⚠️ DANGER: DISABLING ALL SYNC BY shouldSyncHistoryMsg PREVENTS BAILEYS FROM ACCESSING INITIAL LID MAPPINGS, LEADING TO INSTABILIY AND SESSION ERRORS'
 		)
 	}
 
@@ -201,8 +196,9 @@ export const makeSocket = (config: SocketConfig) => {
 			})
 			return result
 		} catch (error) {
+			// Catch timeout and return undefined instead of throwing
 			if (error instanceof Boom && error.output?.statusCode === DisconnectReason.timedOut) {
-				logger?.debug?.({ msgId }, 'timed out waiting for message')
+				logger?.warn?.({ msgId }, 'timed out waiting for message')
 				return undefined
 			}
 
@@ -252,7 +248,7 @@ export const makeSocket = (config: SocketConfig) => {
 		}
 	}
 
-	// Rotate our signed pre-key on server
+	// Rotate our signed pre-key on server; on failure, run digest as fallback and rethrow
 	const rotateSignedPreKey = async (): Promise<void> => {
 		const newId = (creds.signedPreKey.keyId || 0) + 1
 		const skey = await signedKeyPair(creds.signedIdentityKey, newId)
@@ -267,6 +263,7 @@ export const makeSocket = (config: SocketConfig) => {
 				}
 			]
 		})
+		// Persist new signed pre-key in creds
 		ev.emit('creds.update', { signedPreKey: skey })
 	}
 
@@ -275,6 +272,8 @@ export const makeSocket = (config: SocketConfig) => {
 			throw new Boom('USyncQuery must have at least one protocol')
 		}
 
+		// todo: validate users, throw WARNING on no valid users
+		// variable below has only validated users
 		const validUsers = usyncQuery.users
 
 		const userNodes = validUsers.map(user => {
@@ -298,7 +297,6 @@ export const makeSocket = (config: SocketConfig) => {
 			attrs: {},
 			content: usyncQuery.protocols.map(a => a.getQueryElement())
 		}
-
 		const iq = {
 			tag: 'iq',
 			attrs: {
@@ -346,7 +344,7 @@ export const makeSocket = (config: SocketConfig) => {
 		}
 
 		if (usyncQuery.users.length === 0) {
-			return []
+			return [] // return early without forcing an empty query
 		}
 
 		const results = await executeUSyncQuery(usyncQuery)
@@ -369,7 +367,7 @@ export const makeSocket = (config: SocketConfig) => {
 		}
 
 		if (usyncQuery.users.length === 0) {
-			return []
+			return [] // return early without forcing an empty query
 		}
 
 		const results = await executeUSyncQuery(usyncQuery)
@@ -384,6 +382,7 @@ export const makeSocket = (config: SocketConfig) => {
 	const ev = makeEventBuffer(logger)
 
 	const { creds } = authState
+	// add transaction capability
 	const keys = addTransactionCapability(authState.keys, logger, transactionOpts)
 	const signalRepository = makeSignalRepository({ creds, keys }, logger, pnFromLIDUSync)
 
@@ -394,17 +393,11 @@ export const makeSocket = (config: SocketConfig) => {
 	let closed = false
 	/** guards against the 'open' handler running the handshake twice on the same socket */
 	let handshakeStarted = false
-
-
+	/** periodically re-validates pre-keys on the server so corruption is caught & repaired
+	 *  automatically on bots that stay connected for days, instead of only checking once at login */
 	let preKeyHealthInterval: NodeJS.Timeout | undefined
-	const PRE_KEY_HEALTH_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000 
+	const PRE_KEY_HEALTH_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000 // every 6 hours
 
-	let preKeyConsecutiveFailures = 0
-	let preKeyBackoffUntil = 0
-	let preKeyLastCheckedAt = 0
-	const PREKEY_CHECK_COOLDOWN_MS = 5 * 60 * 1000       
-	const PREKEY_MAX_CONSECUTIVE_FAILURES = 5
-	const PREKEY_FAILURE_BACKOFF_MS = 30 * 60 * 1000  
 	const socketEndHandlers: Array<(error: Error | undefined) => void | Promise<void>> = []
 
 	/** log & process any unexpected errors */
@@ -503,7 +496,7 @@ export const makeSocket = (config: SocketConfig) => {
 	/** generates and uploads a set of pre-keys to the server */
 	const uploadPreKeys = async (count = MIN_PREKEY_COUNT) => {
 		if (uploadPreKeysPromise) {
-			logger.debug('pre-key upload already in progress, waiting for completion')
+			logger.debug('Pre-key upload already in progress, waiting for completion')
 			await uploadPreKeysPromise
 			return
 		}
@@ -520,19 +513,17 @@ export const makeSocket = (config: SocketConfig) => {
 				return node
 			}, creds?.me?.id || 'upload-pre-keys')
 
-			// Upload to server (outside transaction — can fail without affecting local keys)
+			// Upload to server (outside transaction, can fail without affecting local keys)
 			try {
 				await query(node)
 				logger.info({ count }, 'uploaded pre-keys successfully')
 			} catch (uploadError) {
-				logger.warn(
-					{ count, attempt: retryCount + 1, err: (uploadError as Error).message },
-					'pre-key upload to server failed'
-				)
+				logger.error({ uploadError: (uploadError as Error).toString(), count }, 'Failed to upload pre-keys to server')
 
+				// Recurse into uploadLogic; calling uploadPreKeys would await its own in-flight promise.
 				if (retryCount < 3) {
 					const backoffDelay = Math.min(1000 * Math.pow(2, retryCount), 10000)
-					logger.debug({ backoffDelay }, 'retrying pre-key upload')
+					logger.info(`Retrying pre-key upload in ${backoffDelay}ms`)
 					await new Promise(resolve => setTimeout(resolve, backoffDelay))
 					return uploadLogic(retryCount + 1)
 				}
@@ -568,25 +559,7 @@ export const makeSocket = (config: SocketConfig) => {
 		return { exists, currentPreKeyId }
 	}
 
-
-	const uploadPreKeysToServerIfRequired = async (force = false) => {
-		const now = Date.now()
-		if (!force && now < preKeyBackoffUntil) {
-			logger.debug(
-				{ resumesIn: Math.round((preKeyBackoffUntil - now) / 1000) + 's' },
-				'prekey check skipped (circuit breaker active)'
-			)
-			return
-		}
-
-		// Cooldown: avoid hammering the server on rapid reconnects
-		if (!force && now - preKeyLastCheckedAt < PREKEY_CHECK_COOLDOWN_MS) {
-			logger.debug('prekey check skipped (cooldown)')
-			return
-		}
-
-		preKeyLastCheckedAt = now
-
+	const uploadPreKeysToServerIfRequired = async () => {
 		try {
 			let count = 0
 			const preKeyCount = await getAvailablePreKeysOnServer()
@@ -594,44 +567,27 @@ export const makeSocket = (config: SocketConfig) => {
 			else count = MIN_PREKEY_COUNT
 			const { exists: currentPreKeyExists, currentPreKeyId } = await verifyCurrentPreKeyExists()
 
+			logger.info(`${preKeyCount} pre-keys found on server`)
+			logger.info(`Current prekey ID: ${currentPreKeyId}, exists in storage: ${currentPreKeyExists}`)
+
 			const lowServerCount = preKeyCount <= count
 			const missingCurrentPreKey = !currentPreKeyExists && currentPreKeyId > 0
+
 			const shouldUpload = lowServerCount || missingCurrentPreKey
 
 			if (shouldUpload) {
-				const reasons: string[] = []
+				const reasons = []
 				if (lowServerCount) reasons.push(`server count low (${preKeyCount})`)
-				if (missingCurrentPreKey) reasons.push(`prekey ${currentPreKeyId} missing from storage`)
+				if (missingCurrentPreKey) reasons.push(`current prekey ${currentPreKeyId} missing from storage`)
 
-				logger.info({ reasons }, 'uploading prekeys')
+				logger.info(`Uploading PreKeys due to: ${reasons.join(', ')}`)
 				await uploadPreKeys(count)
 			} else {
-				logger.debug(
-					{ serverCount: preKeyCount, currentPreKeyId, currentPreKeyExists },
-					'prekey health OK'
-				)
+				logger.info(`PreKey validation passed - Server: ${preKeyCount}, Current prekey ${currentPreKeyId} exists`)
 			}
-
-			// Success — reset circuit breaker
-			preKeyConsecutiveFailures = 0
-			preKeyBackoffUntil = 0
 		} catch (error) {
-			preKeyConsecutiveFailures++
-
-			if (preKeyConsecutiveFailures >= PREKEY_MAX_CONSECUTIVE_FAILURES) {
-				preKeyBackoffUntil = Date.now() + PREKEY_FAILURE_BACKOFF_MS
-				logger.warn(
-					{ failures: preKeyConsecutiveFailures, backoffMs: PREKEY_FAILURE_BACKOFF_MS },
-					'prekey circuit breaker tripped — pausing checks'
-				)
-				preKeyConsecutiveFailures = 0 // reset counter for next window
-			} else {
-				logger.warn(
-					{ err: (error as Error).message, failures: preKeyConsecutiveFailures },
-					'prekey health check failed'
-				)
-			}
-			// Never throw — prekey failures must not disconnect the session
+			logger.error({ error }, 'Failed to check/upload pre-keys during initialization')
+			// Don't throw - allow connection to continue even if pre-key check fails
 		}
 	}
 
@@ -681,17 +637,7 @@ export const makeSocket = (config: SocketConfig) => {
 		}
 
 		closed = true
-
-		// Classify log level: auth/forbidden errors are expected terminal states,
-		// not surprise failures
-		const statusCode = (error as Boom)?.output?.statusCode
-		const isFatalLogout = statusCode && UNAUTHORIZED_CODES.includes(statusCode)
-
-		if (isFatalLogout) {
-			logger.info({ statusCode, trace: error?.stack }, 'connection terminated (logged out)')
-		} else {
-			logger.info({ trace: error?.stack }, error ? 'connection errored' : 'connection closed')
-		}
+		logger.info({ trace: error?.stack }, error ? 'connection errored' : 'connection closed')
 
 		clearInterval(keepAliveReq)
 		clearTimeout(qrTimer)
@@ -699,22 +645,23 @@ export const makeSocket = (config: SocketConfig) => {
 		handshakeStarted = false
 		uploadPreKeysPromise = null
 
-		// Detach every listener: prevents leaking closures if the caller holds a stale reference,
-		// and guarantees a fresh makeSocket() call never ends up with two live sockets reacting
-		// to the same underlying connection.
+		// detach every listener we ever attached to this socket instance - prevents leaking
+		// closures (creds/keys/ev references) if the caller keeps a stale reference around,
+		// and guarantees a fresh `makeSocket()` call can never end up with two live sockets
+		// reacting to the same underlying connection.
 		ws.removeAllListeners()
 
 		try {
 			signalRepository.close?.()
 		} catch (closeErr) {
-			logger.trace({ closeErr }, 'error while closing signal repository')
+			logger.trace({ closeErr }, 'error while closing signal repository during cleanup')
 		}
 
 		if (!ws.isClosed && !ws.isClosing) {
 			try {
 				await ws.close()
 			} catch (closeErr) {
-				logger.trace({ closeErr }, 'error while closing websocket')
+				logger.trace({ closeErr }, 'error while closing websocket during cleanup')
 			}
 		}
 
@@ -722,7 +669,7 @@ export const makeSocket = (config: SocketConfig) => {
 			try {
 				await handler(error)
 			} catch (err) {
-				logger.warn({ err }, 'error in socket end handler')
+				logger.error({ err }, 'error in socket end handler')
 			}
 		}
 
@@ -768,13 +715,14 @@ export const makeSocket = (config: SocketConfig) => {
 			}
 
 			const diff = Date.now() - lastDateRecv.getTime()
-
+			/*
+				check if it's been a suspicious amount of time since the server responded with our last seen
+				it could be that the network is down
+			*/
 			if (diff > keepAliveIntervalMs + 5000) {
-				// Server has been silent longer than expected — network is likely down
 				void end(new Boom('Connection was lost', { statusCode: DisconnectReason.connectionLost }))
 			} else if (ws.isOpen) {
-				// Send keep-alive ping. Log failures at debug — a single missed ping
-				// is a transient hiccup; the diff check above handles sustained silence.
+				// if its all good, send a keep alive request
 				query({
 					tag: 'iq',
 					attrs: {
@@ -785,13 +733,12 @@ export const makeSocket = (config: SocketConfig) => {
 					},
 					content: [{ tag: 'ping', attrs: {} }]
 				}).catch(err => {
-					logger.debug({ code: (err as Boom)?.output?.statusCode }, 'keep-alive ping missed')
+					logger.error({ trace: err.stack }, 'error in sending keep alive')
 				})
 			} else {
-				logger.debug('keep-alive skipped: WebSocket not open')
+				logger.warn('keep alive called when WS not open')
 			}
 		}, keepAliveIntervalMs))
-
 	/** i have no idea why this exists. pls enlighten me */
 	const sendPassiveIq = (tag: 'passive' | 'active') =>
 		query({
@@ -859,6 +806,7 @@ export const makeSocket = (config: SocketConfig) => {
 					attrs: {
 						jid: authState.creds.me.id,
 						stage: 'companion_hello',
+
 						should_show_push_notification: 'true'
 					},
 					content: [
@@ -920,12 +868,11 @@ export const makeSocket = (config: SocketConfig) => {
 		})
 	}
 
-
 	ws.on('message', onMessageReceived)
 
 	ws.on('open', async () => {
 		if (handshakeStarted) {
-			logger.debug('ignoring duplicate "open" event — handshake already in progress')
+			logger.warn('ignoring duplicate "open" event - handshake already in progress')
 			return
 		}
 
@@ -938,63 +885,56 @@ export const makeSocket = (config: SocketConfig) => {
 			void end(err)
 		}
 	})
-
 	ws.on('error', mapWebSocketError(end))
 	ws.on('close', () => void end(new Boom('Connection Terminated', { statusCode: DisconnectReason.connectionClosed })))
-
-	// The server terminated the connection
+	// the server terminated the connection
 	ws.on(
 		'CB:xmlstreamend',
 		() => void end(new Boom('Connection Terminated by Server', { statusCode: DisconnectReason.connectionClosed }))
 	)
-
-
+	// QR gen
 	ws.on('CB:iq,type:set,pair-device', async (stanza: BinaryNode) => {
-		try {
-			const iq: BinaryNode = {
-				tag: 'iq',
-				attrs: {
-					to: S_WHATSAPP_NET,
-					type: 'result',
-					id: stanza.attrs.id!
-				}
+		const iq: BinaryNode = {
+			tag: 'iq',
+			attrs: {
+				to: S_WHATSAPP_NET,
+				type: 'result',
+				id: stanza.attrs.id!
 			}
-			await sendNode(iq)
-
-			const pairDeviceNode = getBinaryNodeChild(stanza, 'pair-device')
-			const refNodes = getBinaryNodeChildren(pairDeviceNode, 'ref')
-			const noiseKeyB64 = Buffer.from(creds.noiseKey.public).toString('base64')
-			const identityKeyB64 = Buffer.from(creds.signedIdentityKey.public).toString('base64')
-			const advB64 = creds.advSecretKey
-
-			let qrMs = qrTimeout || 60_000
-			const genPairQR = () => {
-				if (!ws.isOpen) {
-					return
-				}
-
-				const refNode = refNodes.shift()
-				if (!refNode) {
-					void end(new Boom('QR refs attempts ended', { statusCode: DisconnectReason.timedOut }))
-					return
-				}
-
-				const ref = (refNode.content as Buffer).toString('utf-8')
-				const qr = buildPairingQRData(ref, noiseKeyB64, identityKeyB64, advB64, browser)
-
-				ev.emit('connection.update', { qr })
-
-				qrTimer = setTimeout(genPairQR, qrMs)
-				qrMs = qrTimeout || 20_000
-			}
-
-			genPairQR()
-		} catch (err) {
-			logger.error({ err }, 'error handling pair-device')
-			void end(err as Error)
 		}
-	})
+		await sendNode(iq)
 
+		const pairDeviceNode = getBinaryNodeChild(stanza, 'pair-device')
+		const refNodes = getBinaryNodeChildren(pairDeviceNode, 'ref')
+		const noiseKeyB64 = Buffer.from(creds.noiseKey.public).toString('base64')
+		const identityKeyB64 = Buffer.from(creds.signedIdentityKey.public).toString('base64')
+		const advB64 = creds.advSecretKey
+
+		let qrMs = qrTimeout || 60_000 // time to let a QR live
+		const genPairQR = () => {
+			if (!ws.isOpen) {
+				return
+			}
+
+			const refNode = refNodes.shift()
+			if (!refNode) {
+				void end(new Boom('QR refs attempts ended', { statusCode: DisconnectReason.timedOut }))
+				return
+			}
+
+			const ref = (refNode.content as Buffer).toString('utf-8')
+			const qr = buildPairingQRData(ref, noiseKeyB64, identityKeyB64, advB64, browser)
+
+			ev.emit('connection.update', { qr })
+
+			qrTimer = setTimeout(genPairQR, qrMs)
+			qrMs = qrTimeout || 20_000 // shorter subsequent qrs
+		}
+
+		genPairQR()
+	})
+	// device paired for the first time
+	// if device pairs successfully, the server asks to restart the connection
 	ws.on('CB:iq,,pair-success', async (stanza: BinaryNode) => {
 		logger.debug('pair success recv')
 		try {
@@ -1012,44 +952,43 @@ export const makeSocket = (config: SocketConfig) => {
 			await sendNode(reply)
 			void sendUnifiedSession()
 		} catch (error: any) {
-			logger.warn({ trace: error.stack }, 'error in pairing')
+			logger.info({ trace: error.stack }, 'error in pairing')
 			void end(error)
 		}
 	})
-
+	// login complete
 	ws.on('CB:success', async (node: BinaryNode) => {
 		try {
 			updateServerTimeOffset(node)
-			// force=true so the first check after login bypasses the cooldown gate
-			await uploadPreKeysToServerIfRequired(true)
+			await uploadPreKeysToServerIfRequired()
 			await sendPassiveIq('active')
 
-			// Validate key-bundle against server after login
+			// After successful login, validate our key-bundle against server
 			try {
 				await digestKeyBundle()
 			} catch (e) {
-				logger.debug({ e }, 'digest check after login failed — will retry on next health cycle')
+				logger.warn({ e }, 'failed to run digest after login')
 			}
 		} catch (err) {
 			logger.warn({ err }, 'failed to send initial passive iq')
 		}
 
 		logger.info('opened connection to WA')
-		clearTimeout(qrTimer)
+		clearTimeout(qrTimer) // will never happen in all likelyhood -- but just in case WA sends success on first try
 
-		// Start the recurring prekey health check.
-		// any manual intervention — the same logic that runs once at login now keeps
-		// running for the lifetime of the socket.
+		// proactively re-check pre-key health on a recurring basis. This is what lets a
+		// 24/7 bot self-heal from corrupted/exhausted pre-keys without ever needing a
+		// manual session wipe - the same logic that runs once at login now keeps running
+		// for as long as the socket stays open.
 		clearInterval(preKeyHealthInterval)
 		preKeyHealthInterval = setInterval(() => {
 			uploadPreKeysToServerIfRequired().catch(err => {
-				// Already handled inside uploadPreKeysToServerIfRequired, but guard
-				// again here so an unexpected throw never kills the interval
-				logger.debug({ err }, 'prekey health interval: unexpected error (already handled)')
+				logger.trace({ err }, 'periodic pre-key health check failed, will retry next cycle')
 			})
 		}, PRE_KEY_HEALTH_CHECK_INTERVAL_MS)
 
 		ev.emit('creds.update', { me: { ...authState.creds.me!, lid: node.attrs.lid } })
+
 		ev.emit('connection.update', { connection: 'open' })
 		void sendUnifiedSession()
 
@@ -1059,8 +998,10 @@ export const makeSocket = (config: SocketConfig) => {
 				try {
 					const myPN = authState.creds.me!.id
 
+					// Store our own LID-PN mapping
 					await signalRepository.lidMapping.storeLIDPNMappings([{ lid: myLID, pn: myPN }])
 
+					// Create device list for our own user (needed for bulk migration)
 					const { user, device } = jidDecode(myPN)!
 					await authState.keys.set({
 						'device-list': {
@@ -1068,52 +1009,28 @@ export const makeSocket = (config: SocketConfig) => {
 						}
 					})
 
+					// migrate our own session
 					await signalRepository.migrateSession(myPN, myLID)
 
-					logger.info({ myPN, myLID }, 'own LID session created successfully')
+					logger.info({ myPN, myLID }, 'Own LID session created successfully')
 				} catch (error) {
-					logger.warn({ error, lid: myLID }, 'failed to create own LID session')
+					logger.error({ error, lid: myLID }, 'Failed to create own LID session')
 				}
 			})
 		}
 	})
 
-	ws.on('CB:notification,,encrypt', (node: BinaryNode) => {
-		try {
-			const countNode = getBinaryNodeChild(node, 'count')
-			if (countNode) {
-				const serverCount = +countNode.attrs.value
-				logger.debug({ serverCount }, 'server sent prekey count notification')
-
-				if (serverCount <= MIN_PREKEY_COUNT) {
-					logger.info({ serverCount }, 'server reports low prekey count — uploading now')
-					uploadPreKeys(MIN_PREKEY_COUNT).catch(err => {
-						logger.warn({ err }, 'failed to upload prekeys after server low-count notification')
-					})
-				}
-			}
-		} catch (err) {
-			logger.debug({ err }, 'error handling encrypt notification')
-		}
-	})
-
 	ws.on('CB:stream:error', (node: BinaryNode) => {
 		const [reasonNode] = getAllBinaryNodeChildren(node)
-		const { reason, statusCode } = getErrorCodeFromStreamError(node)
+		logger.error({ reasonNode, fullErrorNode: node }, 'stream errored out')
 
-		const isFatal = statusCode && UNAUTHORIZED_CODES.includes(statusCode)
-		if (isFatal) {
-			logger.warn({ reason, statusCode }, 'stream error (fatal — session terminated)')
-		} else {
-			logger.warn({ reason, statusCode, reasonNode }, 'stream error')
-		}
+		const { reason, statusCode } = getErrorCodeFromStreamError(node)
 
 		void end(new Boom(`Stream Errored (${reason})`, { statusCode, data: reasonNode || node }))
 	})
-
+	// stream fail, possible logout
 	ws.on('CB:failure', (node: BinaryNode) => {
 		const reason = +(node.attrs.reason || 500)
-		logger.warn({ reason, attrs: node.attrs }, 'connection failure')
 		void end(new Boom('Connection Failure', { statusCode: reason, data: node.attrs }))
 	})
 
@@ -1122,35 +1039,28 @@ export const makeSocket = (config: SocketConfig) => {
 	})
 
 	ws.on('CB:ib,,offline_preview', async (node: BinaryNode) => {
-		logger.debug('offline preview received')
-		try {
-			await sendNode({
-				tag: 'ib',
-				attrs: {},
-				content: [{ tag: 'offline_batch', attrs: { count: '100' } }]
-			})
-		} catch (err) {
-			logger.debug({ err }, 'error sending offline_batch response')
-		}
+		logger.info('offline preview received', JSON.stringify(node))
+		await sendNode({
+			tag: 'ib',
+			attrs: {},
+			content: [{ tag: 'offline_batch', attrs: { count: '100' } }]
+		})
 	})
 
 	ws.on('CB:ib,,edge_routing', (node: BinaryNode) => {
-		try {
-			const edgeRoutingNode = getBinaryNodeChild(node, 'edge_routing')
-			const routingInfo = getBinaryNodeChild(edgeRoutingNode, 'routing_info')
-			if (routingInfo?.content) {
-				authState.creds.routingInfo = Buffer.from(routingInfo?.content as Uint8Array)
-				ev.emit('creds.update', authState.creds)
-			}
-		} catch (err) {
-			logger.debug({ err }, 'error handling edge_routing')
+		const edgeRoutingNode = getBinaryNodeChild(node, 'edge_routing')
+		const routingInfo = getBinaryNodeChild(edgeRoutingNode, 'routing_info')
+		if (routingInfo?.content) {
+			authState.creds.routingInfo = Buffer.from(routingInfo?.content as Uint8Array)
+			ev.emit('creds.update', authState.creds)
 		}
 	})
-
 
 	let didStartBuffer = false
 	process.nextTick(() => {
 		if (creds.me?.id) {
+			// start buffering important events
+			// if we're logged in
 			ev.buffer()
 			didStartBuffer = true
 		}
@@ -1158,41 +1068,35 @@ export const makeSocket = (config: SocketConfig) => {
 		ev.emit('connection.update', { connection: 'connecting', receivedPendingNotifications: false, qr: undefined })
 	})
 
+	// called when all offline notifs are handled
 	ws.on('CB:ib,,offline', (node: BinaryNode) => {
-		try {
-			const child = getBinaryNodeChild(node, 'offline')
-			const offlineNotifs = +(child?.attrs.count || 0)
+		const child = getBinaryNodeChild(node, 'offline')
+		const offlineNotifs = +(child?.attrs.count || 0)
 
-			logger.info(`handled ${offlineNotifs} offline messages/notifications`)
-			if (didStartBuffer) {
-				ev.flush()
-				logger.trace('flushed events for initial buffer')
-			}
-
-			ev.emit('connection.update', { receivedPendingNotifications: true })
-		} catch (err) {
-			logger.warn({ err }, 'error handling offline notification flush')
+		logger.info(`handled ${offlineNotifs} offline messages/notifications`)
+		if (didStartBuffer) {
+			ev.flush()
+			logger.trace('flushed events for initial buffer')
 		}
+
+		ev.emit('connection.update', { receivedPendingNotifications: true })
 	})
 
-
+	// update credentials when required
 	ev.on('creds.update', update => {
-		try {
-			const name = update.me?.name
-			if (creds.me?.name !== name) {
-				logger.debug({ name }, 'updated pushName')
-				sendNode({
-					tag: 'presence',
-					attrs: { name: name! }
-				}).catch(err => {
-					logger.debug({ err }, 'error sending presence update on name change')
-				})
-			}
-
-			Object.assign(creds, update)
-		} catch (err) {
-			logger.warn({ err }, 'error in creds.update handler')
+		const name = update.me?.name
+		// if name has just been received
+		if (creds.me?.name !== name) {
+			logger.debug({ name }, 'updated pushName')
+			sendNode({
+				tag: 'presence',
+				attrs: { name: name! }
+			}).catch(err => {
+				logger.warn({ trace: err.stack }, 'error in sending presence update on name change')
+			})
 		}
+
+		Object.assign(creds, update)
 	})
 
 	const updateServerTimeOffset = ({ attrs }: BinaryNode) => {
@@ -1321,9 +1225,9 @@ export const makeSocket = (config: SocketConfig) => {
 }
 
 /**
- * Map the websocket error to the right Boom type so the caller's
- * reconnection logic can inspect the status code.
- */
+ * map the websocket error to the right type
+ * so it can be retried by the caller
+ * */
 function mapWebSocketError(handler: (err: Error) => void) {
 	return (error: Error) => {
 		handler(new Boom(`WebSocket Error (${error?.message})`, { statusCode: getCodeFromWSError(error), data: error }))
