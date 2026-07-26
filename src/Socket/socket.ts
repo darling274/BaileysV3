@@ -63,20 +63,6 @@ import { USyncQuery, USyncUser } from '../WAUSync/'
 import { WebSocketClient } from './Client'
 import { executeWMexQuery } from './mex.js'
 
-/**
- * Connects to WA servers and performs:
- * - simple queries (no retry mechanism, wait for connection establishment)
- * - listen to messages and emit events
- * - query phone connection
- *
- * Optimized for 24/7 operation:
- * - Prekey circuit breaker: backs off after repeated server failures
- * - Prekey cooldown: min 5 min between health checks to avoid hammering
- * - Prekey low notification handler: reacts immediately when WA reports low keys
- * - All async event handlers guarded with try/catch (no unhandled rejections)
- * - Keep-alive ping failures logged at debug (not error) — expected during hiccups
- * - Stream errors classified as fatal vs transient (only fatal ones log as error)
- */
 export const makeSocket = (config: SocketConfig) => {
 	const {
 		waWebSocketUrl,
@@ -173,11 +159,7 @@ export const makeSocket = (config: SocketConfig) => {
 		return sendRawMessage(buff)
 	}
 
-	/**
-	 * Wait for a message with a certain tag to be received
-	 * @param msgId the message tag to await
-	 * @param timeoutMs timeout after which the promise will reject
-	 */
+	
 	const waitForMessage = async <T>(msgId: string, timeoutMs = defaultQueryTimeoutMs) => {
 		let onRecv: ((data: T) => void) | undefined
 		let onErr: ((err: Error) => void) | undefined
@@ -580,20 +562,10 @@ export const makeSocket = (config: SocketConfig) => {
 		return { exists, currentPreKeyId }
 	}
 
-	/**
-	 * Checks whether we need to upload prekeys to the server and uploads if so.
-	 *
-	 * Guards:
-	 * - Cooldown gate  : skips if called within PREKEY_CHECK_COOLDOWN_MS of the last check
-	 * - Circuit breaker: backs off for PREKEY_FAILURE_BACKOFF_MS after too many consecutive failures
-	 *
-	 * Both guards are bypassed when force=true (used on first login).
-	 * Never throws — prekey failures must not disconnect the session.
-	 */
+	
 	const uploadPreKeysToServerIfRequired = async (force = false) => {
 		const now = Date.now()
 
-		// Circuit breaker: in backoff window after repeated failures
 		if (!force && now < preKeyBackoffUntil) {
 			logger.debug(
 				{ resumesIn: Math.round((preKeyBackoffUntil - now) / 1000) + 's' },
@@ -602,7 +574,6 @@ export const makeSocket = (config: SocketConfig) => {
 			return
 		}
 
-		// Cooldown: avoid hammering the server on rapid reconnects
 		if (!force && now - preKeyLastCheckedAt < PREKEY_CHECK_COOLDOWN_MS) {
 			logger.debug('prekey check skipped (cooldown)')
 			return
@@ -654,7 +625,6 @@ export const makeSocket = (config: SocketConfig) => {
 					'prekey health check failed'
 				)
 			}
-			// Never throw — prekey failures must not disconnect the session
 		}
 	}
 
@@ -722,9 +692,6 @@ export const makeSocket = (config: SocketConfig) => {
 		handshakeStarted = false
 		uploadPreKeysPromise = null
 
-		// Detach every listener: prevents leaking closures if the caller holds a stale reference,
-		// and guarantees a fresh makeSocket() call never ends up with two live sockets reacting
-		// to the same underlying connection.
 		ws.removeAllListeners()
 
 		try {
